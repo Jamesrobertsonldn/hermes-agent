@@ -157,6 +157,11 @@ def kanban_command(args: argparse.Namespace) -> int:
     # the `--board` routing override (else `--board beta boards show` reports beta).
     if action == "boards":
         return _dispatch_boards(args)
+    # Custody is an operator-only scan across the board registry, not a read from
+    # the selected board; dispatch before board routing and database auto-init.
+    if action == "custody":
+        from hermes_cli.kanban_custody import custody_command
+        return custody_command(args)
 
     # `--board <slug>` pins HERMES_KANBAN_BOARD for the duration of this call so it inherits the
     # exact resolution the dispatcher uses for workers.
