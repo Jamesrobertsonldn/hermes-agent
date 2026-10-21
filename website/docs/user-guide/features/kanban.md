@@ -52,9 +52,17 @@ Declare PR work at creation with `--completion-contract OWNER/REPO` (or an exact
 accepts the same `completion_contract`. Use `local-only` for intentionally local
 work; existing and undeclared cards retain that default. Prose URLs are not policy.
 
-After publishing, pass `metadata.published_pr` to completion. The first matching
-URL binds the card permanently; retries cannot substitute a green sibling PR.
-CLI `show --json` and `kanban_show` expose the persisted contract.
+After publishing, pass `metadata.published_pr` and `metadata.verification` to
+completion. Verification records the exact test command, `exit_code: 0`, and the
+PR `head_sha` it tested; a missing, failed, or stale verification cannot complete
+the card. The first matching PR URL binds the card permanently; retries cannot
+substitute a green sibling PR. CLI `show --json` and `kanban_show` expose the
+persisted contract.
+
+Repository worktree tasks are admitted from a freshly fetched `origin/HEAD`.
+The dispatcher records that base before starting the worker and preserves it on
+resume. A stale or dirty worktree without an admission receipt is refused and
+kept for review; it is never reset or rebased automatically.
 
 The shared `complete_task` boundary covers worker tools, CLI, review approval and
 dashboard completion. It reads classic branch protection and active ruleset

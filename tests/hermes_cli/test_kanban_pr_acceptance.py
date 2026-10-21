@@ -11,6 +11,13 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
 
 
+def _metadata(url, head="a" * 40, *, exit_code=0):
+    return {"published_pr": url, "verification": {
+        "command": "python -m pytest tests/targeted_test.py", "exit_code": exit_code,
+        "head_sha": head,
+    }}
+
+
 @pytest.fixture
 def github(tmp_path, monkeypatch):
     state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": []}
@@ -21,7 +28,8 @@ def github(tmp_path, monkeypatch):
             sha = state["head"]
             if self.path == "/graphql":
                 value = {"data": {"repository": {"pullRequest": {
-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+                    "headRefOid": sha, "changedFiles": 0 if state.get("empty_diff") else 1,
+                    "baseRefName": "main", "state": "OPEN",
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
                         {"context": "required", "app": {"databaseId": 1}}]}}}}}}
             elif "/rules/branches/" in self.path:
@@ -81,7 +89,7 @@ def test_pr_completion_requires_current_required_evidence(github):
         for conclusion in ("failure", "pending", "cancelled", "timed_out", "action_required", "neutral", "skipped", None, "success"):
             github.update(conclusion=conclusion, head="a" * 40)
             tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
-            ok = kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            ok = kb.complete_task(conn, tid, result="done", metadata=_metadata("https://github.com/acme/repo/pull/7"))
             assert ok is (conclusion == "success")
             task = kb.get_task(conn, tid)
             assert (task.status == "done") is ok
@@ -92,21 +100,35 @@ def test_pr_completion_requires_current_required_evidence(github):
                 assert task.status in {"running", "ready", "blocked", "review"}
                 assert "retry" in receipts[-1]["recovery"]
                 assert receipts[-1]["checks"][0]["id"] == 42
-        for fault in ("missing", "stale", "head_change"):
+        for fault in ("missing", "stale", "head_change", "empty_diff"):
             github.update(conclusion="success", head="a" * 40)
             github[fault] = True
             tid = kb.create_task(conn, title=fault, completion_contract="acme/repo")
-            assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            assert not kb.complete_task(conn, tid, result="done", metadata=_metadata("https://github.com/acme/repo/pull/7"))
             assert kb.get_task(conn, tid).status != "done"
             github.pop(fault)
         # Omission and a sibling repository cannot downgrade the stored declaration.
         tid = kb.create_task(conn, title="publish", completion_contract="acme/repo")
         assert not kb.complete_task(conn, tid, summary="local green")
-        assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/other/repo/pull/7"})
+        assert not kb.complete_task(conn, tid, result="done", metadata=_metadata("https://github.com/other/repo/pull/7"))
         before = len(github["requests"])
         local = kb.create_task(conn, title="local", completion_contract="local-only")
         assert kb.complete_task(conn, local, summary="https://github.com/acme/repo/pull/7 is background context")
         assert len(github["requests"]) == before
+
+
+@pytest.mark.platforms("linux")
+def test_pr_completion_rejects_success_summary_without_recorded_verification(github):
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Repair CI", completion_contract="acme/repo")
+        metadata = {"published_pr": "https://github.com/acme/repo/pull/7"}
+        assert not kb.complete_task(conn, tid, summary="CI fixed and tests passed", metadata=metadata)
+        assert kb.get_task(conn, tid).status != "done"
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
+        ).fetchone()[0])
+        assert receipt["classification"] == "missing"
+        assert "verification" in receipt["detail"]
 
 
 @pytest.mark.platforms("linux")
@@ -123,7 +145,7 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
                     github["replacement"] = kb.claim_task(rival, tid).current_run_id
             github.update(conclusion=conclusion, race=reclaim)
             assert not kb.complete_task(conn, tid, result="done", expected_run_id=run_id,
-                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+                metadata=_metadata("https://github.com/acme/repo/pull/7"))
             assert kb.get_task(conn, tid).current_run_id == github["replacement"]
             assert github["replacement"] != run_id
             assert kb.get_task(conn, tid).status != "done"
@@ -163,7 +185,7 @@ def test_acceptance_runs_gh_as_the_assignee_profile(tmp_path, monkeypatch):
     with connect() as conn:
         tid = kb.create_task(conn, title="as-b", completion_contract="acme/repo", assignee="b")
         assert not kb.complete_task(conn, tid, result="done",
-                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+                                    metadata=_metadata("https://github.com/acme/repo/pull/7"))
         assert kb.get_task(conn, tid).status != "done"
         receipts = [json.loads(r[0]) for r in conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))]
@@ -206,7 +228,7 @@ def test_assignee_without_own_gh_login_never_falls_through_to_ambient_login(tmp_
     with connect() as conn:
         tid = kb.create_task(conn, title="as-b", completion_contract="acme/repo", assignee="b")
         assert not kb.complete_task(conn, tid, result="done",
-                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+                                    metadata=_metadata("https://github.com/acme/repo/pull/7"))
         receipt = json.loads(conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
@@ -225,7 +247,7 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
     with connect() as conn:
         tid = kb.create_task(conn, title="as-ghost", completion_contract="acme/repo", assignee="ghost")
         assert not kb.complete_task(conn, tid, result="done",
-                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+                                    metadata=_metadata("https://github.com/acme/repo/pull/7"))
         receipt = json.loads(conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"

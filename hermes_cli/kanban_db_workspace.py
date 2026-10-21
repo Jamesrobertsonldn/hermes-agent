@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -686,17 +687,64 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _remote_default_base(repo_root: Path) -> tuple[str, str]:
+    """Fetch and return the live ``origin/HEAD`` branch and its exact commit."""
+    fetched = _git(repo_root, "fetch", "--no-tags", "origin", timeout=90)
+    if fetched.returncode != 0:
+        raise RuntimeError("cannot verify current origin default branch before worktree admission")
+    default = _git(repo_root, "remote", "set-head", "origin", "--auto", timeout=30)
+    if default.returncode != 0:
+        raise RuntimeError("origin default branch is unavailable; refusing worktree admission")
+    symbolic = _git(repo_root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", timeout=10)
+    if symbolic.returncode != 0 or not symbolic.stdout.strip().startswith("origin/"):
+        raise RuntimeError("origin default branch is unavailable; refusing worktree admission")
+    branch = symbolic.stdout.strip().removeprefix("origin/")
+    resolved = _git(repo_root, "rev-parse", "--verify", f"refs/remotes/origin/{branch}^{{commit}}", timeout=10)
+    if resolved.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", resolved.stdout.strip()):
+        raise RuntimeError("origin default branch commit is unavailable; refusing worktree admission")
+    return branch, resolved.stdout.strip()
+
+
+def admit_worktree_base(workspace: Path, *, recorded_base: str | None = None) -> dict[str, str]:
+    """Prove a fresh worktree starts at live origin/HEAD, or resumes its recorded base."""
+    repo_root = _git_toplevel(workspace)
+    if repo_root is None:
+        raise RuntimeError("worktree is not inside a Git repository; refusing task admission")
+    head = _git(workspace, "rev-parse", "--verify", "HEAD^{commit}", timeout=10)
+    if head.returncode != 0:
+        raise RuntimeError("worktree HEAD is unavailable; refusing task admission")
+    head_sha = head.stdout.strip()
+    if recorded_base:
+        if not re.fullmatch(r"[0-9a-f]{40}", recorded_base):
+            raise RuntimeError("recorded worktree base is invalid; preserve it for review")
+        ancestry = _git(workspace, "merge-base", "--is-ancestor", recorded_base, "HEAD", timeout=10)
+        if ancestry.returncode != 0:
+            raise RuntimeError("worktree no longer descends from its recorded admission base; preserve it for review")
+        return {"base_sha": recorded_base}
+    branch, base_sha = _remote_default_base(repo_root)
+    if head_sha != base_sha:
+        raise RuntimeError(
+            f"stale worktree base: HEAD {head_sha} differs from live origin/{branch} {base_sha}; "
+            "preserve this workspace and start a fresh current-base task"
+        )
+    status = _git(workspace, "status", "--porcelain", "--untracked-files=all", timeout=10)
+    if status.returncode != 0 or status.stdout:
+        raise RuntimeError("unrecorded worktree is not clean at current origin default; preserve it for review")
+    return {"base_branch": branch, "base_sha": base_sha}
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize ``target`` as a linked git worktree from live ``origin/HEAD``."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
         return
     target.parent.mkdir(parents=True, exist_ok=True)
+    _branch, base_sha = _remote_default_base(repo_root)
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
     else:
-        args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
+        args = ["worktree", "add", "-b", branch_name, str(target), base_sha]
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()

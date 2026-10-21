@@ -61,6 +61,12 @@ def _make_repo(tmp_path: Path) -> Path:
     (repo / "README.md").write_text("base\n", encoding="utf-8")
     _git(repo, "add", "README.md")
     _git(repo, "commit", "-m", "init")
+    remote = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "--initial-branch=main", str(remote)],
+                   check=True, capture_output=True, text=True)
+    _git(repo, "remote", "add", "origin", str(remote))
+    _git(repo, "push", "-u", "origin", "main")
+    _git(repo, "remote", "set-head", "origin", "main")
     return repo
 
 
@@ -102,6 +108,35 @@ def test_decompose_worktree_children_get_own_workspace(kanban_home):
             assert row["workspace_path"] is None
 
 
+
+
+def test_new_worktree_uses_live_default_and_stale_worktree_is_preserved(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    old_head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                              check=True, capture_output=True, text=True).stdout.strip()
+    (repo / "current.txt").write_text("current default\n", encoding="utf-8")
+    _git(repo, "add", "current.txt")
+    _git(repo, "commit", "-m", "advance default")
+    _git(repo, "push", "origin", "main")
+    current_head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="repair current code", workspace_kind="worktree",
+                                 workspace_path=str(repo / ".worktrees" / "fresh"))
+        task = kb.get_task(conn, task_id)
+    fresh, _ = kbw._resolve_worktree_workspace(task)
+    assert subprocess.run(["git", "-C", str(fresh), "rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip() == current_head
+    assert kbw.admit_worktree_base(fresh)["base_sha"] == current_head
+
+    stale = repo / ".worktrees" / "stale"
+    _git(repo, "worktree", "add", "-b", "wt/stale", str(stale), old_head)
+    with pytest.raises(RuntimeError, match="stale worktree base"):
+        kbw.admit_worktree_base(stale)
+    assert stale.is_dir()
+    assert subprocess.run(["git", "-C", str(stale), "rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip() == old_head
 
 
 def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):

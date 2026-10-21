@@ -105,12 +105,24 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
 
 
 def collect_acceptance(contract: str, published_pr: str | None,
-                       assignee: str | None = None) -> dict:
+                       assignee: str | None = None, verification: dict | None = None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
-               "pr_url": published_pr, "checks": [],
+               "pr_url": published_pr, "checks": [], "verification": None,
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:
+        command = verification.get("command") if isinstance(verification, dict) else None
+        exit_code = verification.get("exit_code") if isinstance(verification, dict) else None
+        verified_sha = verification.get("head_sha") if isinstance(verification, dict) else None
+        if (not isinstance(command, str) or not command.strip()
+                or type(exit_code) is not int or exit_code != 0
+                or not isinstance(verified_sha, str)
+                or not re.fullmatch(r"[0-9a-f]{40}", verified_sha)):
+            receipt["detail"] = "Supply metadata.verification with a test command, exit_code 0, and the tested PR head_sha."
+            return receipt
+        receipt["verification"] = {
+            "command": command.strip(), "exit_code": exit_code, "head_sha": verified_sha,
+        }
         profile_home = _assignee_profile_home(assignee)
         declared = _PR.fullmatch(contract)
         url = contract if declared else published_pr
@@ -121,7 +133,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
         owner, name = repo.split("/")
-        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
+        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid changedFiles baseRefName state\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
         repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
         if repository is None:
             # A private repo the login cannot read resolves to null, not an error.
@@ -131,6 +143,12 @@ def collect_acceptance(contract: str, published_pr: str | None,
         receipt["head_sha"] = sha
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
+        if verified_sha != sha:
+            receipt.update(classification="stale", detail="Verification command was not recorded against the current PR head.")
+            return receipt
+        if type(pr.get("changedFiles")) is not int or pr["changedFiles"] < 1:
+            receipt.update(classification="missing", detail="The PR has no committed changed files.")
+            return receipt
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
         rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",

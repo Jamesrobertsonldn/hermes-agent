@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -2131,6 +2132,26 @@ def _dispatch_lane_task(
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
             workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
+            admission_row = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='workspace_base_admitted' "
+                "ORDER BY id DESC LIMIT 1", (claimed.id,),
+            ).fetchone()
+            admission = json.loads(admission_row["payload"]) if admission_row else None
+            if admission is not None and (
+                admission.get("workspace") != str(workspace)
+                or admission.get("branch") != resolved_branch_name
+            ):
+                raise RuntimeError("worktree identity changed after admission; preserve it for review")
+            base_receipt = _kbw.admit_worktree_base(
+                workspace, recorded_base=(admission or {}).get("base_sha"),
+            )
+            if admission is None:
+                base_receipt.update({"workspace": str(workspace), "branch": resolved_branch_name})
+                with _kb.write_txn(conn):
+                    _kb._append_event(
+                        conn, claimed.id, "workspace_base_admitted", base_receipt,
+                        run_id=claimed.current_run_id,
+                    )
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
