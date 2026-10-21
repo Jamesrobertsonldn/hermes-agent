@@ -111,7 +111,9 @@ zero outside a kanban task (footprint ladder rung 3).
   `db_dispatch`, `db_notify`, `db_graph` (task initialization and decomposition), `workspace`, ...). Verbs: `init, create, list (ls), show, assign, link,
   unlink, comment, attach, attachments, attach-rm, complete, request-review, request-changes,
   reopen-review, block, unblock, archive, tail`, plus `watch, stats, runs, log, assignees, heartbeat,
-  notify-*, dispatch, daemon, gc`. Argparse alias dispatch must accept both `list` and `ls` (root).
+  notify-*, dispatch, daemon, gc, custody`. `custody --json` is an operator-only read-only scan of
+  registered and archived native board databases; it never initializes/migrates a DB or certifies
+  subject or non-Kanban writer absence. Argparse alias dispatch must accept both `list` and `ls` (root).
 - **Toolset:** `tools/kanban_tools.py` — `kanban_show, kanban_complete, kanban_request_review,
   kanban_request_changes, kanban_block, kanban_schedule, kanban_heartbeat, kanban_comment,
   kanban_create, kanban_link,

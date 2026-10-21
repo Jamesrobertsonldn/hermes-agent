@@ -248,6 +248,8 @@ _SPECS = [
     ], aliases=["ls"], help="List tasks"),
     _cmd("show", [_TASK_ID, _json_flag(), *_run_state_args("filter listed runs by task_runs column")],
          help="Show a task with comments + events"),
+    _cmd("custody", [_json_flag()],
+         help="Export registered/archived native board custody evidence (not absence proof)"),
     _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)")],
          help="Assign or reassign a task"),
     _cmd("set-model", [

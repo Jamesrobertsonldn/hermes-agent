@@ -33,7 +33,15 @@ The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 - **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
-Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
+Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste; most CLI verbs have a tool-call equivalent, while custody is operator-only.
+
+Operators can run `hermes kanban custody --json` for a read-only snapshot of registered boards,
+archived board directories, task/run identity, native producer events, archived task rows, and
+pull-request URLs found in board comments. The command does not include task bodies, event text,
+comment text, run summaries, or errors. It fails closed on missing or unreadable stores and never
+initializes or migrates a database. Each board is snapshotted independently; the output cannot
+prove that no subject worktree or non-Kanban writer exists, account for hard-deleted task history,
+or prevent a write after the snapshot. Worker and delegated-child contexts cannot run this export.
 
 This is the shape that covers the workloads `delegate_task` can't:
 
