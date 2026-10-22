@@ -13,7 +13,8 @@ from hermes_cli.kanban_db_connect import connect
 
 @pytest.fixture
 def github(tmp_path, monkeypatch):
-    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": []}
+    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": [],
+             "draft": False, "classic_required": [{"context": "required", "app": {"databaseId": 1}}]}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -21,10 +22,14 @@ def github(tmp_path, monkeypatch):
             sha = state["head"]
             if self.path == "/graphql":
                 value = {"data": {"repository": {"pullRequest": {
-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN", "isDraft": state["draft"],
+                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": state["classic_required"]}}}}}}
             elif "/rules/branches/" in self.path:
+                if state.get("rules_403"):
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(state.get("rules_error", "Upgrade to GitHub Pro or make this repository public to enable this feature.").encode())
+                    return
                 value = [[]]
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
@@ -38,12 +43,14 @@ def github(tmp_path, monkeypatch):
                     for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
                 if state.get("race"):
                     state["race"]()
+                if state.get("draft_on_check"):
+                    state["draft"] = True
                 if state.get("head_change"):
                     state["head"] = "b" * 40
             elif "/statuses" in self.path:
                 value = [[]]
             elif "/pulls/" in self.path:
-                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open", "draft": state["draft"]}
             else:
                 self.send_error(404)
                 return
@@ -60,9 +67,14 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try:\n"
+                  "    response=urllib.request.urlopen(u)\n"
+                  "except urllib.error.HTTPError as exc:\n"
+                  "    print(f'gh: {exc.read().decode()} (HTTP {exc.code})', file=sys.stderr)\n"
+                  "    sys.exit(1)\n"
+                  "print(response.read().decode())\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -107,6 +119,108 @@ def test_pr_completion_requires_current_required_evidence(github):
         local = kb.create_task(conn, title="local", completion_contract="local-only")
         assert kb.complete_task(conn, local, summary="https://github.com/acme/repo/pull/7 is background context")
         assert len(github["requests"]) == before
+
+
+@pytest.mark.platforms("linux")
+def test_private_repo_ruleset_plan_gate_uses_exact_head_classic_required_checks(github):
+    github["rules_403"] = True
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
+        ).fetchone()[0])
+        assert kb.get_task(conn, tid).status == "done"
+
+    assert receipt["classification"] == "success"
+    assert receipt["head_sha"] == "a" * 40
+    assert receipt["ruleset_evidence"] == "unavailable_private_repo_plan"
+    assert receipt["required"] == [{"context": "required", "app_id": 1}]
+    assert receipt["checks"] == [{
+        "name": "required", "id": 42,
+        "url": "https://github.com/acme/repo/actions/runs/42",
+        "head_sha": "a" * 40, "classification": "success", "conclusion": "success",
+    }]
+    assert any("/rules/branches/main" in path for path in github["requests"])
+    assert any("/commits/" + "a" * 40 + "/check-runs" in path for path in github["requests"])
+
+
+@pytest.mark.platforms("linux")
+def test_private_repo_ruleset_fallback_still_requires_known_successful_checks(github):
+    github.update(rules_403=True, conclusion="failure")
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
+        ).fetchone()[0])
+        assert kb.get_task(conn, tid).status != "done"
+    assert receipt["ruleset_evidence"] == "unavailable_private_repo_plan"
+    assert receipt["classification"] == "failure"
+    assert receipt["checks"][0]["head_sha"] == "a" * 40
+
+    github.update(conclusion="success", classic_required=[])
+    with connect() as conn:
+        tid = kb.create_task(conn, title="No policy evidence", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
+        ).fetchone()[0])
+    assert receipt["classification"] == "missing"
+    assert "Cannot verify required checks" in receipt["detail"]
+
+
+@pytest.mark.platforms("linux")
+def test_other_branch_rules_403_remains_auth_failure(github):
+    github.update(rules_403=True, rules_error="Resource not accessible by integration.")
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
+        ).fetchone()[0])
+        assert kb.get_task(conn, tid).status != "done"
+    assert receipt["classification"] == "auth"
+    assert "HTTP 403 on repos/acme/repo/rules/branches/main" in receipt["detail"]
+
+
+@pytest.mark.platforms("linux")
+def test_draft_pr_cannot_complete_with_green_checks(github):
+    github["draft"] = True
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Draft", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
+        ).fetchone()[0])
+        assert kb.get_task(conn, tid).status != "done"
+    assert receipt["classification"] == "draft"
+    assert "Draft PRs cannot satisfy" in receipt["detail"]
+    assert not any("/check-runs" in path for path in github["requests"])
+
+
+@pytest.mark.platforms("linux")
+def test_pr_becoming_draft_during_checks_cannot_complete(github):
+    github["draft_on_check"] = True
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Draft race", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
+        ).fetchone()[0])
+        assert kb.get_task(conn, tid).status != "done"
+    assert receipt["classification"] == "draft"
+    assert receipt["head_sha"] == "a" * 40
+    assert receipt["checks"][0]["classification"] == "success"
+    assert "became a draft while collecting evidence" in receipt["detail"]
+    assert any("/check-runs" in path for path in github["requests"])
+    assert any("/pulls/7" in path for path in github["requests"])
 
 
 @pytest.mark.platforms("linux")

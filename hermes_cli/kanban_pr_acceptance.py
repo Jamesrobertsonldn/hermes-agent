@@ -18,6 +18,8 @@ from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+_BRANCH_RULES_PATH = re.compile(r"^repos/[^/]+/[^/]+/rules/branches/")
+_PRIVATE_RULES_UNAVAILABLE = "upgrade to github pro or make this repository public"
 
 
 def validate_contract(value: str | None) -> str:
@@ -45,6 +47,9 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
         # code + endpoint, never gh's stderr (credentials/host details).
         denied = re.search(r"HTTP (40[134])", exc.stderr or "")
         if denied:
+            if (denied[1] == "403" and _BRANCH_RULES_PATH.match(endpoint)
+                    and _PRIVATE_RULES_UNAVAILABLE in (exc.stderr or "").lower()):
+                raise _BranchRulesUnavailable(endpoint.split("?")[0]) from None
             raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
         if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
             raise _GateAuthError(f"gh has no login for {endpoint.split('?')[0]}") from None
@@ -59,6 +64,10 @@ class _GateAuthError(RuntimeError):
     """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
     this profile's login cannot see the repo — an identity problem to fix, not
     an infrastructure blip to retry."""
+
+
+class _BranchRulesUnavailable(RuntimeError):
+    """GitHub plan feature gate prevents reading branch rulesets for this repo."""
 
 
 def _gh_env(profile_home: str | None) -> dict[str, str] | None:
@@ -121,7 +130,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
         owner, name = repo.split("/")
-        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
+        query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state isDraft\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
         repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
         if repository is None:
             # A private repo the login cannot read resolves to null, not an error.
@@ -131,10 +140,19 @@ def collect_acceptance(contract: str, published_pr: str | None,
         receipt["head_sha"] = sha
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
+        if pr["isDraft"]:
+            receipt.update(classification="draft", detail="Draft PRs cannot satisfy a PR completion contract.")
+            return receipt
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                         paginate=True, profile_home=profile_home)
+        except _BranchRulesUnavailable:
+            # Keep classic branch-protection evidence mandatory. If it exposes no
+            # required checks, fail closed below instead of assuming empty policy.
+            rules = []
+            receipt["ruleset_evidence"] = "unavailable_private_repo_plan"
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
@@ -142,7 +160,11 @@ def collect_acceptance(contract: str, published_pr: str | None,
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
+            if receipt.get("ruleset_evidence"):
+                receipt["detail"] = ("Cannot verify required checks: branch rulesets are unavailable for this private-repository plan, "
+                                     "and classic branch protection supplied no required checks.")
+            else:
+                receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
             return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)
@@ -172,6 +194,10 @@ def collect_acceptance(contract: str, published_pr: str | None,
                     "classification": classification, "conclusion": outcome})
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
+        if current.get("draft"):
+            receipt.update(classification="draft",
+                           detail="PR became a draft while collecting evidence; it cannot satisfy a PR completion contract.")
+            return receipt
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
             return receipt
